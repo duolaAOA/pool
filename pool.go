@@ -14,12 +14,12 @@ type Factory func() (net.Conn, error)
 // Factory is a function to create new connections.
 type Pool struct {
 	// storage for our net.Conn connections
-	conns chan net.Conn
+	mu 		sync.Mutex
+	conns   chan net.Conn
 
 	// net.Conn generator
 	factory Factory
 
-	mu sync.Mutex // protects isDesroyed field
 }
 
 // New returns a new pool with an initial capacity and maximum capacity.
@@ -78,57 +78,50 @@ func (p *Pool) Get() (net.Conn, error) {
 
 // Put puts an existing connection into the pool. If the pool is full or closed, conn is
 // simply closed.
-func (p *Pool) Put(conn net.Conn) {
+func (p *Pool) Put(conn net.Conn) error {
 	if conn == nil {
-		return
+		return errors.New("connection is nil. rejecting")
 	}
-	if !p.put(conn) {
-		_ = conn.Close()
-	}
-}
 
-func (p *Pool) put(conn net.Conn) bool {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if p.conns == nil {
-		return false
+		return errors.New("pool is closed")
 	}
 
 	select {
-	case p.conns <- conn:
-		return true
+	case p.conns <-conn:
+		return nil
 	default:
+		_ = conn.Close()
+		return errors.New("pool is full")
 	}
-	return false
 }
 
 // Close closes the pool and all its connections. After Close() the
 // pool is no longer usable.
 func (p *Pool) Close() {
-	conns := p.closePool()
+	p.mu.Lock()
+	conns := p.conns
+	p.conns = nil
+	p.factory = nil
+	p.mu.Unlock()
+
 	if conns == nil {
 		return
 	}
+
 	close(conns)
 	for conn := range conns {
 		_ = conn.Close()
 	}
 }
 
-func (p *Pool) closePool() chan net.Conn {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	conns := p.conns
-	p.conns = nil
-	p.factory = nil
-	return conns
-}
-
 // MaximumCapacity returns the maximum capacity of the pool
 func (p *Pool) MaximumCapacity() int {
 	return cap(p.conns)
 }
-// UsedCapacity returns the used capacity of the pool.
-func (p *Pool) UsedCapacity() int {
+// CurrentCapacity returns the used capacity of the pool.
+func (p *Pool) CurrentCapacity() int {
 	return len(p.conns)
 }

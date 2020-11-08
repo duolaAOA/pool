@@ -14,19 +14,12 @@ var (
 	network	   = "tcp"
 	address	   = "127.0.0.1:7777"
 	factory    = func() (net.Conn, error) {return net.Dial(network, address)}
-	testPool   = &Pool{}
 )
 
 func init() {
 	// used for factory function
 	go simpleTCPSERVER()
 	time.Sleep(time.Millisecond * 300) // wait until tcp server has been settled
-
-	var err error
-	testPool, err = newPool()
-	if err != nil {
-		log.Fatalln(err)
-	}
 }
 
 func TestNew(t *testing.T) {
@@ -37,21 +30,26 @@ func TestNew(t *testing.T) {
 }
 
 func TestPool_Get(t *testing.T) {
-	_, err := testPool.Get()
+	p, _ := newPool()
+	defer p.Close()
+
+	_, err := p.Get()
 	if err != nil {
 		t.Errorf("Get error: %s", err)
 	}
 
-	if testPool.UsedCapacity() != (InitialCap - 1) {
-		t.Errorf("Get error. Expecting %d, got %d", InitialCap - 1, testPool.UsedCapacity())
+	// after one get, current capacity should be lowered by one.
+	if p.CurrentCapacity() != (InitialCap - 1) {
+		t.Errorf("Get error. Expecting %d, got %d", InitialCap - 1, p.CurrentCapacity())
 	}
 
+	// get  all
 	var wg sync.WaitGroup
 	for i := 0; i < (InitialCap - 1); i++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			_, err := testPool.Get()
+			_, err := p.Get()
 			if err != nil {
 				t.Errorf("Get error: %s", err)
 			}
@@ -60,45 +58,90 @@ func TestPool_Get(t *testing.T) {
 
 	wg.Wait()
 
-	if testPool.UsedCapacity() != 0 {
-		t.Errorf("Get error. Expecting %d, got %d", InitialCap - 1, testPool.UsedCapacity())
+	if p.CurrentCapacity() != 0 {
+		t.Errorf("Get error. Expecting %d, got %d", InitialCap - 1, p.CurrentCapacity())
 	}
 
-	_, err = testPool.Get()
+	_, err = p.Get()
 	if err != nil {
 		t.Errorf("Get error: %s", err)
 	}
 }
 
 func TestPool_Put(t *testing.T) {
-	conn, err := testPool.Get()
-	if err != nil {
-		t.Errorf("Put, get error: %s", err)
+	p, _ := newPool()
+	defer p.Close()
+
+	for i := 0; i < MaximumCap; i++ {
+		conn, _ := p.factory()
+		p.Put(conn)
 	}
 
-	testPool.Put(conn)
-
-	if testPool.UsedCapacity() != 1 {
+	if p.MaximumCapacity() != MaximumCap {
 		t.Errorf("Put error. Expecting %d, got %d",
-			1, testPool.UsedCapacity())
+			1, p.CurrentCapacity())
+	}
+
+	err := p.Put(nil)
+	if err == nil {
+		t.Errorf("Put error. A nil conn should be rejected")
+	}
+
+	conn, _ := p.factory()
+	err = p.Put(conn) // try to put into a full pool
+	if err == nil {
+		t.Errorf("Put error. Put into a full pool should return an error")
 	}
 }
 
 func TestPool_MaximumCapacity(t *testing.T) {
-	// Create new pool to test it
 	p, _ := newPool()
 	if p.MaximumCapacity() != MaximumCap {
 		t.Errorf("MaximumCapacity error. Expecting %d, got %d",
-			MaximumCap, testPool.UsedCapacity())
+			MaximumCap, p.CurrentCapacity())
 	}
 }
 
 func TestPool_UsedCapacity(t *testing.T) {
 	// Create new pool to test it
 	p, _ := newPool()
-	if p.UsedCapacity() != InitialCap {
+	if p.CurrentCapacity() != InitialCap {
 		t.Errorf("InitialCap error. Expecting %d, got %d",
-			InitialCap, p.UsedCapacity())
+			InitialCap, p.CurrentCapacity())
+	}
+}
+
+func TestPool_Close(t *testing.T) {
+	p, _ := newPool()
+	conn, _ := p.factory() // to be used with put
+
+	// now close it and test all cases we are expecting.
+	p.Close()
+
+	if p.conns != nil {
+		t.Errorf("Close error, conns channel should be nil")
+	}
+
+	if p.factory != nil {
+		t.Errorf("Close error, factory should be nil")
+	}
+
+	_, err := p.Get()
+	if err == nil {
+		t.Errorf("Close error, get conn should return an error")
+	}
+
+	err = p.Put(conn)
+	if conn == nil {
+		t.Errorf("Close error, put conn should return an error")
+	}
+
+	if p.CurrentCapacity() != 0 {
+		t.Errorf("Close error used capacity. Expecting 0, got %d", p.CurrentCapacity())
+	}
+
+	if p.MaximumCapacity() != 0 {
+		t.Errorf("Close error max capacity. Expecting 0, got %d", p.MaximumCapacity())
 	}
 }
 
@@ -122,6 +165,23 @@ func TestPoolConcurrent(t *testing.T) {
 			p.Put(conn)
 		}()
 	}
+}
+
+func TestPoolConcurrent2(t *testing.T) {
+	p, _ := newPool()
+
+	for i := 0; i < MaximumCap; i++ {
+		conn, _ := p.factory()
+		p.Put(conn)
+	}
+
+	for i := 0; i < MaximumCap; i++ {
+		go func() {
+			p.Get()
+		}()
+	}
+
+	p.Close()
 }
 
 func newPool() (*Pool, error)  {

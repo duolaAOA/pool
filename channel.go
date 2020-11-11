@@ -7,9 +7,10 @@ import (
 	"sync"
 )
 
-type ChannelPool struct {
+// channelPool implements the Pool interface based on buffered channels.
+type channelPool struct {
 	// storage for our net.Conn connections
-	mu    sync.Mutex
+	mu    sync.RWMutex
 	conns chan net.Conn
 
 	// net.Conn generator
@@ -21,13 +22,16 @@ type Factory func() (net.Conn, error)
 
 // NewChannelPool returns a new pool based on buffered channels with an initial
 // capacity and maximum capacity. Factory is used when initial capacity is
-// greater than zero to fill the pool.
+// greater than zero to fill the pool. A zero initialCap doesn't fill the Pool
+// until a new Get() is called. During a Get(), If there is no new connection
+// available in the pool, a new connection will be created via the Factory()
+// method.
 func NewChannelPool(initialCap, maxCap int, factory Factory) (Pool, error) {
-	if initialCap <= 0 || maxCap <= 0 || initialCap > maxCap {
+	if initialCap < 0 || maxCap <= 0 || initialCap > maxCap {
 		return nil, errors.New("invalid capacity settings")
 	}
 
-	c := &ChannelPool{
+	c := &channelPool{
 		conns:   make(chan net.Conn, maxCap),
 		factory: factory,
 	}
@@ -46,62 +50,67 @@ func NewChannelPool(initialCap, maxCap int, factory Factory) (Pool, error) {
 	return c, nil
 }
 
-func (c *ChannelPool) getConns() chan net.Conn {
-	c.mu.Lock()
+func (c *channelPool) getCOnnsAndFactory() (chan net.Conn, Factory) {
+	c.mu.RLock()
 	conns := c.conns
-	c.mu.Unlock()
-	return conns
+	factory := c.factory
+	c.mu.RUnlock()
+	return conns, factory
 }
 
-// Get returns a new connection from the pool. After using the connection it
-// should be put back via the Put() method. If there is no new connection
-// available in the pool, a new connection will be created via the Factory()
-// method.
-func (c *ChannelPool) Get() (net.Conn, error) {
-	conns := c.getConns()
+// Get implements the Pool interfaces Get() method. If there is no new
+// connection available in the pool, a new connection will be created via the
+// Factory() method.
+func (c *channelPool) Get() (net.Conn, error) {
+	conns, factory := c.getCOnnsAndFactory()
 	if conns == nil {
-		return nil, ErrPoolClosed
+		return nil, ErrClosed
 	}
 
+	// wrap our connections with out custom net.Conn implementation (wrapConn
+	// method) that puts the connection back to the pool if it's closed.
 	select {
 	case conn := <-conns:
 		if conn == nil {
-			return nil, ErrPoolClosed
+			return nil, ErrClosed
 		}
-		return conn, nil
+
+		return c.wrapConn(conn), nil
 	default:
-		return c.factory()
+		conn, err := factory()
+		if err != nil {
+			return nil, err
+		}
+
+		return c.wrapConn(conn), nil
 	}
 }
 
-// Put puts an existing connection into the pool. If the pool is full or
-// closed, conn is simply closed. A nil conn will be rejected. Putting into a
-// destroyed or full pool will be counted as an error.
-func (c *ChannelPool) Put(conn net.Conn) error {
+func (c *channelPool) put(conn net.Conn) error {
 	if conn == nil {
 		return errors.New("connection is nil. rejecting")
 	}
 
-	c.mu.Lock()
-	defer c.mu.Unlock()
+	c.mu.RLock()
+	defer c.mu.RUnlock()
 
 	if c.conns == nil {
-		conn.Close()
-		return ErrPoolClosed
+		// pool is closed, cose passed connection
+		return conn.Close()
 	}
 
+	// put the resource back into the pool. If the pool is full, this will
+	// block and the default case will be executed.
 	select {
 	case c.conns <- conn:
 		return nil
 	default:
-		conn.Close()
-		return ErrPoolFull
+		// pool is full, close passed connection
+		return conn.Close()
 	}
 }
 
-// Close closes the pool and all its connections. After Close() the
-// pool is no longer usable.
-func (c *ChannelPool) Close() {
+func (c *channelPool) Close() {
 	c.mu.Lock()
 	conns := c.conns
 	c.conns = nil
@@ -114,12 +123,11 @@ func (c *ChannelPool) Close() {
 
 	close(conns)
 	for conn := range conns {
-		conn.Close()
+		_ = conn.Close()
 	}
 }
 
-// Cap returns the maximum capacity of the pool
-func (c *ChannelPool) Cap() int { return cap(c.getConns()) }
-
-// Len returns the current capacity of the pool.
-func (c *ChannelPool) Len() int { return len(c.getConns()) }
+func (c *channelPool) Len() int {
+	conns, _ := c.getCOnnsAndFactory()
+	return len(conns)
+}
